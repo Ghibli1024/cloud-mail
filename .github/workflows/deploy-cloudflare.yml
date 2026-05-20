@@ -74,12 +74,36 @@ jobs:
           while IFS=$'\t' read -r RECORD_ID RECORD_TYPE RECORD_CONTENT; do
             [ -n "${RECORD_ID}" ] || continue
             echo "Deleting ${RECORD_TYPE} ${CUSTOM_DOMAIN} -> ${RECORD_CONTENT}"
-            DELETE_RESULT="$(curl -fsS -X DELETE \
+            DELETE_RESULT="$(curl -sS -w $'\n%{http_code}' -X DELETE \
               -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
               -H "Content-Type: application/json" \
               "${API}/zones/${ZONE_ID}/dns_records/${RECORD_ID}")"
-            jq -e '.success == true' <<< "${DELETE_RESULT}" >/dev/null
+            DELETE_BODY="${DELETE_RESULT%$'\n'*}"
+            DELETE_CODE="${DELETE_RESULT##*$'\n'}"
+
+            if [ "${DELETE_CODE}" != "200" ]; then
+              echo "Warning: delete returned HTTP ${DELETE_CODE} for ${RECORD_TYPE} ${CUSTOM_DOMAIN}."
+              jq '{ errors, messages }' <<< "${DELETE_BODY}" || true
+            fi
           done <<< "${CONFLICTS}"
+
+          REMAINING="$(curl -fsS \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${API}/zones/${ZONE_ID}/dns_records?name=${CUSTOM_DOMAIN}&per_page=100")"
+
+          STILL_CONFLICTING="$(jq -r '
+            .result[]
+            | select(.name == env.CUSTOM_DOMAIN and (.type == "A" or .type == "AAAA" or .type == "CNAME"))
+            | [.id, .type, .content]
+            | @tsv
+          ' <<< "${REMAINING}")"
+
+          if [ -n "${STILL_CONFLICTING}" ]; then
+            echo "Residual conflicting DNS records remain for ${CUSTOM_DOMAIN}:"
+            printf '%s\n' "${STILL_CONFLICTING}"
+            exit 1
+          fi
 
       - name: ⚙ 设置 pnpm / Set up pnpm
         uses: pnpm/action-setup@v4.1.0
