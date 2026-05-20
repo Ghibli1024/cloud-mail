@@ -303,66 +303,10 @@ jobs:
           echo "worker_url=$WORKER_URL" >> $GITHUB_OUTPUT
           echo "✅ Setup completed."
 
-      - name: 📬 启用邮箱路由 / Enable Email Routing
-        env:
-          ZONE_ID: 9c7ca39bd65cfc264e5a97a1e21f6526
+      - name: 📬 邮箱路由已手动配置 / Email Routing already configured
         run: |
-          set -euo pipefail
-
-          if [ -z "${CUSTOM_DOMAIN:-}" ]; then
-            echo "CUSTOM_DOMAIN is empty; skipping Email Routing setup."
-            exit 0
-          fi
-
-          API="https://api.cloudflare.com/client/v4"
-
-          cf_api() {
-            local method="$1"
-            local path="$2"
-            local body="${3:-}"
-
-            if [ -n "$body" ]; then
-              curl -sS -X "$method" \
-                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-                -H "Content-Type: application/json" \
-                --data "$body" \
-                "${API}${path}"
-            else
-              curl -sS -X "$method" \
-                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-                -H "Content-Type: application/json" \
-                "${API}${path}"
-            fi
-          }
-
-          SETTINGS="$(cf_api GET "/zones/${ZONE_ID}/email/routing")"
-
-          if jq -e '.success == true and .result.enabled == true' <<< "${SETTINGS}" >/dev/null; then
-            echo "Email Routing is already enabled for ${CUSTOM_DOMAIN}."
-          else
-            DNS_PAYLOAD="$(jq -n --arg name "${CUSTOM_DOMAIN}" '{ name: $name }')"
-            DNS_RESULT="$(cf_api POST "/zones/${ZONE_ID}/email/routing/dns" "${DNS_PAYLOAD}")"
-
-            if ! jq -e '.success == true' <<< "${DNS_RESULT}" >/dev/null; then
-              echo "Failed to enable Email Routing DNS."
-              jq '{ errors, messages }' <<< "${DNS_RESULT}"
-              exit 1
-            fi
-          fi
-
-          ROUTE_PAYLOAD="$(jq -n \
-            --arg worker "${NAME}" \
-            '{ actions: [{ type: "worker", value: [$worker] }], matchers: [{ type: "all" }], enabled: true, name: ("Catch-all to " + $worker) }')"
-
-          ROUTE_RESULT="$(cf_api PUT "/zones/${ZONE_ID}/email/routing/rules/catch_all" "${ROUTE_PAYLOAD}")"
-
-          if ! jq -e '.success == true' <<< "${ROUTE_RESULT}" >/dev/null; then
-            echo "Failed to configure Email Routing catch-all."
-            jq '{ errors, messages }' <<< "${ROUTE_RESULT}"
-            exit 1
-          fi
-
-          jq '.result | { enabled, name, actions, matchers }' <<< "${ROUTE_RESULT}"
+          echo "Cloudflare Email Routing is already configured in the dashboard for ${CUSTOM_DOMAIN:-this domain}."
+          echo "Skipping API setup to avoid requiring extra routing permissions on the deploy token."
 
       - name: ♻️ 初始化数据库 / Initialize database
         run: |
