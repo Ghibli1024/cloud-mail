@@ -61,7 +61,7 @@ jobs:
 
           CONFLICTS="$(jq -r '
             .result[]
-            | select(.name == env.CUSTOM_DOMAIN and (.type == "A" or .type == "AAAA" or .type == "CNAME"))
+            | select(.name == env.CUSTOM_DOMAIN and (.type == "A" or .type == "AAAA" or .type == "CNAME") and .content != "100::" and .content != "192.0.2.0")
             | [.id, .type, .content]
             | @tsv
           ' <<< "${RECORDS}")"
@@ -94,7 +94,7 @@ jobs:
 
           STILL_CONFLICTING="$(jq -r '
             .result[]
-            | select(.name == env.CUSTOM_DOMAIN and (.type == "A" or .type == "AAAA" or .type == "CNAME"))
+            | select(.name == env.CUSTOM_DOMAIN and (.type == "A" or .type == "AAAA" or .type == "CNAME") and .content != "100::" and .content != "192.0.2.0")
             | [.id, .type, .content]
             | @tsv
           ' <<< "${REMAINING}")"
