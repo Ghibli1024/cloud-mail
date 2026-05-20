@@ -42,6 +42,45 @@ jobs:
       - name: 🚚 检出代码仓库 / Checkout repository
         uses: actions/checkout@v4
 
+      - name: 🧹 清理根域 DNS 冲突 / Clean conflicting apex DNS records
+        env:
+          ZONE_ID: 9c7ca39bd65cfc264e5a97a1e21f6526
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CUSTOM_DOMAIN:-}" ]; then
+            echo "CUSTOM_DOMAIN is empty; skipping DNS cleanup."
+            exit 0
+          fi
+
+          API="https://api.cloudflare.com/client/v4"
+          RECORDS="$(curl -fsS \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${API}/zones/${ZONE_ID}/dns_records?name=${CUSTOM_DOMAIN}&per_page=100")"
+
+          CONFLICTS="$(jq -r '
+            .result[]
+            | select(.name == env.CUSTOM_DOMAIN and (.type == "A" or .type == "AAAA" or .type == "CNAME"))
+            | [.id, .type, .content]
+            | @tsv
+          ' <<< "${RECORDS}")"
+
+          if [ -z "${CONFLICTS}" ]; then
+            echo "No conflicting apex DNS records found for ${CUSTOM_DOMAIN}."
+            exit 0
+          fi
+
+          while IFS=$'\t' read -r RECORD_ID RECORD_TYPE RECORD_CONTENT; do
+            [ -n "${RECORD_ID}" ] || continue
+            echo "Deleting ${RECORD_TYPE} ${CUSTOM_DOMAIN} -> ${RECORD_CONTENT}"
+            DELETE_RESULT="$(curl -fsS -X DELETE \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              "${API}/zones/${ZONE_ID}/dns_records/${RECORD_ID}")"
+            jq -e '.success == true' <<< "${DELETE_RESULT}" >/dev/null
+          done <<< "${CONFLICTS}"
+
       - name: ⚙ 设置 pnpm / Set up pnpm
         uses: pnpm/action-setup@v4.1.0
         with:
