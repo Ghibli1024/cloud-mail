@@ -7,6 +7,19 @@ on:
       - "mail-worker/**"
       - "mail-vue/**"
   workflow_dispatch:
+    inputs:
+      setup_email_routing:
+        description: 'Configure Cloudflare Email Routing catch-all to the Worker'
+        required: false
+        default: 'false'
+      email_zone_name:
+        description: 'Cloudflare zone name for Email Routing'
+        required: false
+        default: ''
+      email_domain:
+        description: 'Email Routing domain or subdomain'
+        required: false
+        default: ''
 
 jobs:
   Deploy-cloud-mail:
@@ -307,6 +320,88 @@ jobs:
         run: |
           echo "Cloudflare Email Routing is already configured in the dashboard for ${CUSTOM_DOMAIN:-this domain}."
           echo "Skipping API setup to avoid requiring extra routing permissions on the deploy token."
+
+      - name: 📬 配置邮箱路由 / Configure Email Routing
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.setup_email_routing == 'true' }}
+        env:
+          EMAIL_ZONE_NAME: ${{ inputs.email_zone_name }}
+          EMAIL_DOMAIN: ${{ inputs.email_domain }}
+        run: |
+          set -euo pipefail
+
+          API="https://api.cloudflare.com/client/v4"
+          ZONE_NAME="${EMAIL_ZONE_NAME:-}"
+          MAIL_DOMAIN="${EMAIL_DOMAIN:-}"
+
+          if [ -z "$ZONE_NAME" ] || [ -z "$MAIL_DOMAIN" ]; then
+            echo "❌ email_zone_name and email_domain are required."
+            exit 1
+          fi
+
+          ZONE_RESPONSE="$(curl -fsS \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${API}/zones?name=${ZONE_NAME}&per_page=1")"
+          ZONE_ID="$(jq -r '.result[0].id // empty' <<< "$ZONE_RESPONSE")"
+
+          if [ -z "$ZONE_ID" ]; then
+            echo "❌ Cloudflare zone not found: ${ZONE_NAME}"
+            jq '{success, errors, messages}' <<< "$ZONE_RESPONSE" || true
+            exit 1
+          fi
+
+          echo "Zone: ${ZONE_NAME}"
+          echo "Email domain: ${MAIL_DOMAIN}"
+
+          DNS_BODY_INPUT="$(jq -n --arg name "$MAIL_DOMAIN" '{name: $name}')"
+          DNS_RESPONSE="$(curl -sS -w $'\n%{http_code}' -X POST \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$DNS_BODY_INPUT" \
+            "${API}/zones/${ZONE_ID}/email/routing/dns")"
+          DNS_BODY="${DNS_RESPONSE%$'\n'*}"
+          DNS_CODE="${DNS_RESPONSE##*$'\n'}"
+          echo "Email Routing DNS status: ${DNS_CODE}"
+          jq '{success, errors, messages, result}' <<< "$DNS_BODY" || true
+
+          if [ "$DNS_CODE" != "200" ] && [ "$DNS_CODE" != "201" ]; then
+            echo "❌ Failed to configure Email Routing DNS."
+            exit 1
+          fi
+
+          CATCH_ALL_BODY="$(jq -n \
+            --arg domain "$MAIL_DOMAIN" \
+            --arg worker "$NAME" \
+            '{
+              enabled: true,
+              matchers: [
+                {
+                  type: "all"
+                }
+              ],
+              actions: [
+                {
+                  type: "worker",
+                  value: [$worker]
+                }
+              ],
+              name: ("catch-all to " + $worker + " for " + $domain)
+            }')"
+
+          CATCH_ALL_RESPONSE="$(curl -sS -w $'\n%{http_code}' -X PUT \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$CATCH_ALL_BODY" \
+            "${API}/zones/${ZONE_ID}/email/routing/rules/catch_all")"
+          CATCH_ALL_RESULT="${CATCH_ALL_RESPONSE%$'\n'*}"
+          CATCH_ALL_CODE="${CATCH_ALL_RESPONSE##*$'\n'}"
+          echo "Catch-all status: ${CATCH_ALL_CODE}"
+          jq '{success, errors, messages, result: {enabled: .result.enabled, name: .result.name, tag: .result.tag, actions: .result.actions}}' <<< "$CATCH_ALL_RESULT" || true
+
+          if [ "$CATCH_ALL_CODE" != "200" ] && [ "$CATCH_ALL_CODE" != "201" ]; then
+            echo "❌ Failed to configure catch-all routing."
+            exit 1
+          fi
 
       - name: ♻️ 初始化数据库 / Initialize database
         run: |
