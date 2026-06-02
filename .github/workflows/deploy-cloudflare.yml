@@ -42,6 +42,77 @@ jobs:
       - name: 🚚 检出代码仓库 / Checkout repository
         uses: actions/checkout@v4
 
+      - name: 🛰️ 准备 ghibli1024.cyou Zone / Prepare ghibli1024.cyou zone
+        env:
+          NEW_ZONE_NAME: ghibli1024.cyou
+          NEW_MAIL_DOMAIN: edu.ghibli1024.cyou
+          NEW_MAIL_WORKER: cloud-mail-ghibli1024
+        run: |
+          set -euo pipefail
+
+          API="https://api.cloudflare.com/client/v4"
+
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "CLOUDFLARE_API_TOKEN is empty."
+            exit 1
+          fi
+
+          if [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "CLOUDFLARE_ACCOUNT_ID is empty."
+            exit 1
+          fi
+
+          get_zone() {
+            curl -fsS \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              "${API}/zones?name=${NEW_ZONE_NAME}&account.id=${CLOUDFLARE_ACCOUNT_ID}&per_page=1"
+          }
+
+          ZONE_RESPONSE="$(get_zone)"
+          ZONE_ID="$(jq -r '.result[0].id // empty' <<< "${ZONE_RESPONSE}")"
+
+          if [ -z "${ZONE_ID}" ]; then
+            echo "Zone ${NEW_ZONE_NAME} not found. Creating it in Cloudflare..."
+            CREATE_RESPONSE="$(curl -sS -w $'\n%{http_code}' -X POST \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "{\"name\":\"${NEW_ZONE_NAME}\",\"account\":{\"id\":\"${CLOUDFLARE_ACCOUNT_ID}\"},\"type\":\"full\"}" \
+              "${API}/zones")"
+            CREATE_BODY="${CREATE_RESPONSE%$'\n'*}"
+            CREATE_CODE="${CREATE_RESPONSE##*$'\n'}"
+
+            if [ "${CREATE_CODE}" != "200" ]; then
+              echo "Zone create failed with HTTP ${CREATE_CODE}."
+              jq '{success, errors, messages}' <<< "${CREATE_BODY}" || true
+              exit 1
+            fi
+
+            ZONE_RESPONSE="${CREATE_BODY}"
+          fi
+
+          ZONE_ID="$(jq -r '(.result | if type == "array" then .[0] else . end).id' <<< "${ZONE_RESPONSE}")"
+          ZONE_STATUS="$(jq -r '(.result | if type == "array" then .[0] else . end).status' <<< "${ZONE_RESPONSE}")"
+          NAME_SERVERS="$(jq -r '(.result | if type == "array" then .[0] else . end).name_servers | join(",")' <<< "${ZONE_RESPONSE}")"
+
+          echo "ZONE_ID=${ZONE_ID}"
+          echo "ZONE_STATUS=${ZONE_STATUS}"
+          echo "NAME_SERVERS=${NAME_SERVERS}"
+
+          echo "Inspecting Email Routing state for ${NEW_ZONE_NAME}..."
+          curl -sS \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${API}/zones/${ZONE_ID}/email/routing" \
+            | jq '{success, result, errors, messages}' || true
+
+          echo "Inspecting Email Routing subdomains for ${NEW_MAIL_DOMAIN}..."
+          curl -sS \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${API}/zones/${ZONE_ID}/email/routing/subdomains" \
+            | jq '{success, result, errors, messages}' || true
+
       - name: 🧹 清理根域 DNS 冲突 / Clean conflicting apex DNS records
         env:
           ZONE_ID: 9c7ca39bd65cfc264e5a97a1e21f6526
