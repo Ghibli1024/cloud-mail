@@ -1,0 +1,91 @@
+name: Setup ghibli1024.cyou Cloudflare zone
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup-zone:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+      ZONE_NAME: ghibli1024.cyou
+    steps:
+      - name: Create or inspect zone
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          API="https://api.cloudflare.com/client/v4"
+
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "CLOUDFLARE_API_TOKEN is missing."
+            exit 1
+          fi
+
+          if [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "CLOUDFLARE_ACCOUNT_ID is missing."
+            exit 1
+          fi
+
+          get_zone() {
+            curl -fsS \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              "${API}/zones?name=${ZONE_NAME}&account.id=${CLOUDFLARE_ACCOUNT_ID}&per_page=1"
+          }
+
+          ZONE_RESPONSE="$(get_zone)"
+          ZONE_ID="$(jq -r '.result[0].id // empty' <<< "${ZONE_RESPONSE}")"
+
+          if [ -z "${ZONE_ID}" ]; then
+            echo "Zone ${ZONE_NAME} not found. Creating..."
+            CREATE_RESPONSE="$(curl -sS -w $'\n%{http_code}' -X POST \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "{\"name\":\"${ZONE_NAME}\",\"account\":{\"id\":\"${CLOUDFLARE_ACCOUNT_ID}\"},\"type\":\"full\"}" \
+              "${API}/zones")"
+            CREATE_BODY="${CREATE_RESPONSE%$'\n'*}"
+            CREATE_CODE="${CREATE_RESPONSE##*$'\n'}"
+            if [ "${CREATE_CODE}" != "200" ]; then
+              echo "Zone create failed with HTTP ${CREATE_CODE}."
+              jq '{success, errors, messages}' <<< "${CREATE_BODY}" || true
+              exit 1
+            fi
+            ZONE_RESPONSE="${CREATE_BODY}"
+          fi
+
+          jq -r '
+            .result as $z
+            | if ($z | type) == "array" then $z[0] else $z end
+            | "ZONE_ID=\(.id)\nZONE_STATUS=\(.status)\nNAME_SERVERS=\(.name_servers | join(","))"
+          ' <<< "${ZONE_RESPONSE}"
+
+      - name: Inspect email routing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          API="https://api.cloudflare.com/client/v4"
+          ZONE_RESPONSE="$(curl -fsS \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${API}/zones?name=${ZONE_NAME}&account.id=${CLOUDFLARE_ACCOUNT_ID}&per_page=1")"
+          ZONE_ID="$(jq -r '.result[0].id // empty' <<< "${ZONE_RESPONSE}")"
+
+          if [ -z "${ZONE_ID}" ]; then
+            echo "Zone is still missing; cannot inspect Email Routing."
+            exit 1
+          fi
+
+          STATUS="$(curl -sS \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${API}/zones/${ZONE_ID}/email/routing")"
+          jq '{success, result, errors, messages}' <<< "${STATUS}" || true
+
+          SUBDOMAINS="$(curl -sS \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${API}/zones/${ZONE_ID}/email/routing/subdomains")"
+          jq '{success, result, errors, messages}' <<< "${SUBDOMAINS}" || true
