@@ -1,0 +1,160 @@
+name: Verify cloud-mail setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      zone_name:
+        description: Cloudflare zone name
+        required: true
+        default: ghibli1024.cyou
+      email_domain:
+        description: Email Routing domain or subdomain
+        required: true
+        default: edu.ghibli1024.cyou
+      target_email:
+        description: Cloud Mail address to verify
+        required: true
+        default: admin@edu.ghibli1024.cyou
+      worker_name:
+        description: Cloudflare Worker name
+        required: true
+        default: cloud-mail-ghibli1024
+
+jobs:
+  verify:
+    name: Verify Cloudflare and D1 state
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      D1_DATABASE_ID: ${{ vars.D1_DATABASE_ID }}
+      ZONE_NAME: ${{ inputs.zone_name }}
+      EMAIL_DOMAIN: ${{ inputs.email_domain }}
+      TARGET_EMAIL: ${{ inputs.target_email }}
+      WORKER_NAME: ${{ inputs.worker_name }}
+
+    steps:
+      - name: Check required configuration
+        run: |
+          set -euo pipefail
+
+          for key in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID ZONE_NAME EMAIL_DOMAIN TARGET_EMAIL WORKER_NAME; do
+            if [ -z "${!key:-}" ]; then
+              echo "::error::${key} is required."
+              exit 1
+            fi
+          done
+
+      - name: Verify DNS and Email Routing
+        run: |
+          set -euo pipefail
+
+          API="https://api.cloudflare.com/client/v4"
+
+          zone_response="$(curl -fsS \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${API}/zones?name=${ZONE_NAME}&per_page=1")"
+          zone_id="$(jq -r '.result[0].id // empty' <<< "${zone_response}")"
+
+          if [ -z "${zone_id}" ]; then
+            echo "::error::Cloudflare zone not found or token cannot read it: ${ZONE_NAME}"
+            exit 1
+          fi
+
+          dns_response="$(curl -fsS \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${API}/zones/${zone_id}/dns_records?name=${EMAIL_DOMAIN}&per_page=100")"
+
+          echo "Email DNS records for ${EMAIL_DOMAIN}:"
+          jq -r '.result[] | [.type, .name, .content, (.priority // "")] | @tsv' <<< "${dns_response}"
+
+          mx_count="$(jq '[.result[] | select(.type == "MX")] | length' <<< "${dns_response}")"
+          spf_count="$(jq '[.result[] | select(.type == "TXT" and (.content | contains("_spf.mx.cloudflare.net")))] | length' <<< "${dns_response}")"
+
+          if [ "${mx_count}" -lt 3 ]; then
+            echo "::error::Expected three Cloudflare Email Routing MX records for ${EMAIL_DOMAIN}; found ${mx_count}."
+            exit 1
+          fi
+
+          if [ "${spf_count}" -lt 1 ]; then
+            echo "::error::Expected SPF TXT for ${EMAIL_DOMAIN}."
+            exit 1
+          fi
+
+          catch_all_response="$(curl -fsS \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${API}/zones/${zone_id}/email/routing/rules/catch_all")"
+
+          echo "Catch-all summary:"
+          jq '{enabled: .result.enabled, name: .result.name, matchers: .result.matchers, actions: .result.actions}' <<< "${catch_all_response}"
+
+          worker_target_count="$(jq --arg worker "${WORKER_NAME}" '
+            [
+              .result.actions[]?
+              | select(.type == "worker")
+              | .value[]?
+              | select(. == $worker)
+            ] | length
+          ' <<< "${catch_all_response}")"
+
+          if [ "$(jq -r '.result.enabled' <<< "${catch_all_response}")" != "true" ]; then
+            echo "::error::Catch-all rule is not enabled."
+            exit 1
+          fi
+
+          if [ "${worker_target_count}" -lt 1 ]; then
+            echo "::error::Catch-all rule does not target Worker ${WORKER_NAME}."
+            exit 1
+          fi
+
+      - name: Verify D1 account and recent mail
+        if: ${{ env.D1_DATABASE_ID != '' }}
+        run: |
+          set -euo pipefail
+
+          API="https://api.cloudflare.com/client/v4"
+
+          run_sql() {
+            local query="$1"
+            curl -fsS -X POST \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "$(jq -n --arg sql "${query}" '{sql: $sql}')" \
+              "${API}/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database/${D1_DATABASE_ID}/query"
+          }
+
+          account_sql="
+            SELECT account_id, email, user_id, status, is_del
+            FROM account
+            WHERE lower(email) = lower('${TARGET_EMAIL}')
+            ORDER BY account_id;
+          "
+          account_response="$(run_sql "${account_sql}")"
+
+          echo "Account rows for ${TARGET_EMAIL}:"
+          jq -r '.result[0].results[]? | [.account_id, .email, .user_id, .status, .is_del] | @tsv' <<< "${account_response}"
+
+          account_count="$(jq '[.result[0].results[]?] | length' <<< "${account_response}")"
+          if [ "${account_count}" -lt 1 ]; then
+            echo "::warning::No account row exists for ${TARGET_EMAIL}. Create it in Cloud Mail UI before expecting inbox ownership."
+          fi
+
+          mail_sql="
+            SELECT email_id, to_email, send_email, subject, status, type, user_id, account_id, is_del, create_time
+            FROM email
+            WHERE lower(to_email) = lower('${TARGET_EMAIL}')
+            ORDER BY email_id DESC
+            LIMIT 5;
+          "
+          mail_response="$(run_sql "${mail_sql}")"
+
+          echo "Recent mail rows for ${TARGET_EMAIL}:"
+          jq -r '.result[0].results[]? | [.email_id, .to_email, .send_email, .subject, .status, .type, .user_id, .account_id, .is_del, .create_time] | @tsv' <<< "${mail_response}"
+
+      - name: D1 verification skipped
+        if: ${{ env.D1_DATABASE_ID == '' }}
+        run: |
+          echo "::warning::D1_DATABASE_ID variable is not set; skipped D1 account/mail verification."
