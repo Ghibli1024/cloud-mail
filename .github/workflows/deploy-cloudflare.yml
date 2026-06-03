@@ -20,6 +20,10 @@ on:
         description: 'Email Routing domain or subdomain'
         required: false
         default: ''
+      setup_custom_domains:
+        description: 'Attach CUSTOM_DOMAINS to the Worker through Cloudflare Workers routes'
+        required: false
+        default: 'false'
 
 jobs:
   Deploy-cloud-mail:
@@ -263,15 +267,17 @@ jobs:
             sed -i '/^linuxdo_client_id = /,/^linuxdo_switch = /d' "$CONFIG_FILE"
           fi
           
-          ROUTE_BLOCKS=""
-          while IFS= read -r CUSTOM_HOSTNAME; do
-            [ -n "${CUSTOM_HOSTNAME}" ] || continue
-            ROUTE_BLOCKS="${ROUTE_BLOCKS}[[routes]]
+          CUSTOM_DOMAIN_ROUTES=""
+          if [ "${{ github.event_name == 'workflow_dispatch' && inputs.setup_custom_domains == 'true' }}" = "true" ]; then
+            while IFS= read -r CUSTOM_HOSTNAME; do
+              [ -n "${CUSTOM_HOSTNAME}" ] || continue
+              CUSTOM_DOMAIN_ROUTES="${CUSTOM_DOMAIN_ROUTES}[[routes]]
           pattern = \"${CUSTOM_HOSTNAME}\"
           custom_domain = true
 
           "
-          done <<< "${CUSTOM_DOMAIN_LIST}"
+            done <<< "${CUSTOM_DOMAIN_LIST}"
+          fi
           
           if [ "$(printf '%s' "$CLOUDFLARE_EMAIL" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
             cat >> "$CONFIG_FILE" <<'EOF'
@@ -282,7 +288,7 @@ jobs:
           fi
 
           sed -i "s|\${NAME}|${NAME}|g" "$CONFIG_FILE"
-          CUSTOM_DOMAIN_ROUTES="${ROUTE_BLOCKS}" perl -0pi -e 's/\$\{CUSTOM_DOMAIN_ROUTES\}/$ENV{CUSTOM_DOMAIN_ROUTES}/g' "$CONFIG_FILE"
+          CUSTOM_DOMAIN_ROUTES="${CUSTOM_DOMAIN_ROUTES}" perl -0pi -e 's/\$\{CUSTOM_DOMAIN_ROUTES\}/$ENV{CUSTOM_DOMAIN_ROUTES}/g' "$CONFIG_FILE"
           sed -i "s|\"\${DOMAIN}\"|${DOMAIN}|g" "$CONFIG_FILE"
           sed -i "s|\${ADMIN}|${ADMIN}|g" "$CONFIG_FILE"
           sed -i "s|\${JWT_SECRET}|${JWT_SECRET}|g" "$CONFIG_FILE"
