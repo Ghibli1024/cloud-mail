@@ -1,0 +1,116 @@
+name: Add Cloud Mail account
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_email:
+        description: Cloud Mail address to add to the account table
+        required: true
+      owner_admin:
+        description: Existing Cloud Mail login user that owns the address
+        required: true
+        default: admin@edu.ghibli1024.cyou
+      account_name:
+        description: Optional display name; defaults to email local part
+        required: false
+
+jobs:
+  add-account:
+    name: Add D1 account row
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      D1_DATABASE_ID: ${{ vars.D1_DATABASE_ID }}
+      TARGET_EMAIL: ${{ inputs.target_email }}
+      OWNER_ADMIN: ${{ inputs.owner_admin }}
+      ACCOUNT_NAME: ${{ inputs.account_name }}
+
+    steps:
+      - name: Add account row
+        run: |
+          set -euo pipefail
+
+          for key in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID D1_DATABASE_ID TARGET_EMAIL OWNER_ADMIN; do
+            if [ -z "${!key:-}" ]; then
+              echo "::error::${key} is required."
+              exit 1
+            fi
+          done
+
+          if ! [[ "${TARGET_EMAIL}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]]; then
+            echo "::error::target_email is not a simple email address."
+            exit 1
+          fi
+
+          if ! [[ "${OWNER_ADMIN}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]]; then
+            echo "::error::owner_admin is not a simple email address."
+            exit 1
+          fi
+
+          if [ -z "${ACCOUNT_NAME:-}" ]; then
+            ACCOUNT_NAME="${TARGET_EMAIL%@*}"
+          fi
+
+          if ! [[ "${ACCOUNT_NAME}" =~ ^[A-Za-z0-9._%+-]+$ ]]; then
+            echo "::error::account_name may only contain email-local-part characters."
+            exit 1
+          fi
+
+          API="https://api.cloudflare.com/client/v4"
+
+          run_sql() {
+            local query="$1"
+            curl -sS -w $'\n%{http_code}' -X POST \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "$(jq -n --arg sql "${query}" '{sql: $sql}')" \
+              "${API}/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database/${D1_DATABASE_ID}/query"
+          }
+
+          insert_sql="
+            INSERT INTO account (email, name, user_id)
+            SELECT '${TARGET_EMAIL}', '${ACCOUNT_NAME}', user_id
+            FROM user
+            WHERE lower(email) = lower('${OWNER_ADMIN}')
+              AND NOT EXISTS (
+                SELECT 1 FROM account
+                WHERE lower(email) = lower('${TARGET_EMAIL}')
+              );
+          "
+
+          insert_response="$(run_sql "${insert_sql}")"
+          insert_body="${insert_response%$'\n'*}"
+          insert_code="${insert_response##*$'\n'}"
+
+          if [ "${insert_code}" != "200" ]; then
+            echo "::error::Cloudflare D1 insert failed. HTTP ${insert_code}."
+            jq '{success, errors, messages}' <<< "${insert_body}" || true
+            exit 1
+          fi
+
+          verify_sql="
+            SELECT account_id, email, name, user_id, status, is_del
+            FROM account
+            WHERE lower(email) = lower('${TARGET_EMAIL}')
+            ORDER BY account_id;
+          "
+
+          verify_response="$(run_sql "${verify_sql}")"
+          verify_body="${verify_response%$'\n'*}"
+          verify_code="${verify_response##*$'\n'}"
+
+          if [ "${verify_code}" != "200" ]; then
+            echo "::error::Cloudflare D1 verify failed. HTTP ${verify_code}."
+            jq '{success, errors, messages}' <<< "${verify_body}" || true
+            exit 1
+          fi
+
+          echo "Account rows for ${TARGET_EMAIL}:"
+          jq -r '.result[0].results[]? | [.account_id, .email, .name, .user_id, .status, .is_del] | @tsv' <<< "${verify_body}"
+
+          row_count="$(jq '[.result[0].results[]?] | length' <<< "${verify_body}")"
+          if [ "${row_count}" -lt 1 ]; then
+            echo "::error::No account row exists for ${TARGET_EMAIL} after insert."
+            exit 1
+          fi
