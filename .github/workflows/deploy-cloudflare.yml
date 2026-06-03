@@ -453,8 +453,15 @@ jobs:
           jq '{success, errors, messages, result}' <<< "$DNS_BODY" || true
 
           if [ "$DNS_CODE" != "200" ] && [ "$DNS_CODE" != "201" ]; then
-            echo "❌ Failed to configure Email Routing DNS."
-            exit 1
+            PUBLIC_MX_COUNT="$(dig +short MX "$MAIL_DOMAIN" @1.1.1.1 | grep -c 'mx.cloudflare.net' || true)"
+            PUBLIC_SPF_COUNT="$(dig +short TXT "$MAIL_DOMAIN" @1.1.1.1 | grep -c '_spf.mx.cloudflare.net' || true)"
+
+            if [ "$PUBLIC_MX_COUNT" -lt 3 ] || [ "$PUBLIC_SPF_COUNT" -lt 1 ]; then
+              echo "❌ Failed to configure Email Routing DNS and public MX/SPF records are incomplete."
+              exit 1
+            fi
+
+            echo "::warning::Email Routing DNS API returned HTTP ${DNS_CODE}, but public MX/SPF records already exist for ${MAIL_DOMAIN}; continuing to catch-all setup."
           fi
 
           CATCH_ALL_BODY="$(jq -n \
