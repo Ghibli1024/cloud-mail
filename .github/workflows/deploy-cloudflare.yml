@@ -29,6 +29,7 @@ jobs:
     env:
       NAME: ${{ secrets.NAME || vars.NAME || 'cloud-mail' }}
       CUSTOM_DOMAIN: ${{ secrets.CUSTOM_DOMAIN || vars.CUSTOM_DOMAIN }}
+      CUSTOM_DOMAINS: ${{ secrets.CUSTOM_DOMAINS || vars.CUSTOM_DOMAINS || secrets.CUSTOM_DOMAIN || vars.CUSTOM_DOMAIN }}
       DOMAIN: ${{ secrets.DOMAIN || vars.DOMAIN }}
       ADMIN: ${{ secrets.ADMIN || vars.ADMIN }}
       JWT_SECRET: ${{ secrets.JWT_SECRET || vars.JWT_SECRET }}
@@ -55,68 +56,135 @@ jobs:
       - name: 🚚 检出代码仓库 / Checkout repository
         uses: actions/checkout@v4
 
-      - name: 🧹 清理根域 DNS 冲突 / Clean conflicting apex DNS records
-        env:
-          ZONE_ID: 9c7ca39bd65cfc264e5a97a1e21f6526
+      - name: 🧭 规范入口域名 / Normalize custom domains
         run: |
           set -euo pipefail
 
-          if [ -z "${CUSTOM_DOMAIN:-}" ]; then
-            echo "CUSTOM_DOMAIN is empty; skipping DNS cleanup."
-            exit 0
+          RAW_CUSTOM_DOMAINS="${CUSTOM_DOMAINS:-${CUSTOM_DOMAIN:-}}"
+
+          if [ -z "${RAW_CUSTOM_DOMAINS}" ]; then
+            CUSTOM_DOMAIN_LIST=""
+          elif jq -e 'type == "array"' >/dev/null 2>&1 <<< "${RAW_CUSTOM_DOMAINS}"; then
+            CUSTOM_DOMAIN_LIST="$(jq -r '.[]' <<< "${RAW_CUSTOM_DOMAINS}")"
+          else
+            CUSTOM_DOMAIN_LIST="$(printf '%s\n' "${RAW_CUSTOM_DOMAINS}" | tr ',[:space:]' '\n')"
           fi
 
+          CUSTOM_DOMAIN_LIST="$(printf '%s\n' "${CUSTOM_DOMAIN_LIST}" \
+            | sed -E 's#^https?://##; s#/.*$##' \
+            | sed '/^$/d' \
+            | sort -u)"
+          FIRST_CUSTOM_DOMAIN="$(printf '%s\n' "${CUSTOM_DOMAIN_LIST}" | sed -n '1p')"
+
+          {
+            echo "CUSTOM_DOMAIN_LIST<<EOF"
+            printf '%s\n' "${CUSTOM_DOMAIN_LIST}"
+            echo "EOF"
+            echo "FIRST_CUSTOM_DOMAIN=${FIRST_CUSTOM_DOMAIN}"
+          } >> "${GITHUB_ENV}"
+
+          if [ -z "${CUSTOM_DOMAIN_LIST}" ]; then
+            echo "::warning:: CUSTOM_DOMAINS variable is not set."
+          else
+            echo "Custom domains:"
+            printf '%s\n' "${CUSTOM_DOMAIN_LIST}"
+          fi
+
+      - name: 🧹 清理根域 DNS 冲突 / Clean conflicting apex DNS records
+        run: |
+          set -euo pipefail
           API="https://api.cloudflare.com/client/v4"
-          RECORDS="$(curl -fsS \
-            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            "${API}/zones/${ZONE_ID}/dns_records?name=${CUSTOM_DOMAIN}&per_page=100")"
 
-          CONFLICTS="$(jq -r '
-            .result[]
-            | select(.name == env.CUSTOM_DOMAIN and (.type == "A" or .type == "AAAA" or .type == "CNAME") and .content != "100::" and .content != "192.0.2.0")
-            | [.id, .type, .content]
-            | @tsv
-          ' <<< "${RECORDS}")"
+          find_zone_id() {
+            local hostname="$1"
+            local candidate="${hostname}"
 
-          if [ -z "${CONFLICTS}" ]; then
-            echo "No conflicting apex DNS records found for ${CUSTOM_DOMAIN}."
+            while [[ "${candidate}" == *.* ]]; do
+              local response
+              response="$(curl -fsS \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                -H "Content-Type: application/json" \
+                "${API}/zones?name=${candidate}&per_page=1")"
+
+              local zone_id
+              zone_id="$(jq -r '.result[0].id // empty' <<< "${response}")"
+
+              if [ -n "${zone_id}" ]; then
+                printf '%s\n' "${zone_id}"
+                return 0
+              fi
+
+              candidate="${candidate#*.}"
+            done
+
+            return 1
+          }
+
+          if [ -z "${CUSTOM_DOMAIN_LIST}" ]; then
+            echo "CUSTOM_DOMAINS is empty; skipping DNS cleanup."
             exit 0
           fi
 
-          while IFS=$'\t' read -r RECORD_ID RECORD_TYPE RECORD_CONTENT; do
-            [ -n "${RECORD_ID}" ] || continue
-            echo "Deleting ${RECORD_TYPE} ${CUSTOM_DOMAIN} -> ${RECORD_CONTENT}"
-            DELETE_RESULT="$(curl -sS -w $'\n%{http_code}' -X DELETE \
+          while IFS= read -r CUSTOM_HOSTNAME; do
+            [ -n "${CUSTOM_HOSTNAME}" ] || continue
+
+            ZONE_ID="$(find_zone_id "${CUSTOM_HOSTNAME}")"
+            if [ -z "${ZONE_ID}" ]; then
+              echo "Cloudflare zone not found for ${CUSTOM_HOSTNAME}."
+              exit 1
+            fi
+
+            RECORDS="$(curl -fsS \
               -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
               -H "Content-Type: application/json" \
-              "${API}/zones/${ZONE_ID}/dns_records/${RECORD_ID}")"
-            DELETE_BODY="${DELETE_RESULT%$'\n'*}"
-            DELETE_CODE="${DELETE_RESULT##*$'\n'}"
+              "${API}/zones/${ZONE_ID}/dns_records?name=${CUSTOM_HOSTNAME}&per_page=100")"
 
-            if [ "${DELETE_CODE}" != "200" ]; then
-              echo "Warning: delete returned HTTP ${DELETE_CODE} for ${RECORD_TYPE} ${CUSTOM_DOMAIN}."
-              jq '{ errors, messages }' <<< "${DELETE_BODY}" || true
+            CONFLICTS="$(CUSTOM_HOSTNAME="${CUSTOM_HOSTNAME}" jq -r '
+              .result[]
+              | select(.name == env.CUSTOM_HOSTNAME and (.type == "A" or .type == "AAAA" or .type == "CNAME") and .content != "100::" and (.content | startswith("192.0.2.") | not))
+              | [.id, .type, .content]
+              | @tsv
+            ' <<< "${RECORDS}")"
+
+            if [ -z "${CONFLICTS}" ]; then
+              echo "No conflicting DNS records found for ${CUSTOM_HOSTNAME}."
+              continue
             fi
-          done <<< "${CONFLICTS}"
 
-          REMAINING="$(curl -fsS \
-            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            "${API}/zones/${ZONE_ID}/dns_records?name=${CUSTOM_DOMAIN}&per_page=100")"
+            while IFS=$'\t' read -r RECORD_ID RECORD_TYPE RECORD_CONTENT; do
+              [ -n "${RECORD_ID}" ] || continue
+              echo "Deleting ${RECORD_TYPE} ${CUSTOM_HOSTNAME} -> ${RECORD_CONTENT}"
+              DELETE_RESULT="$(curl -sS -w $'\n%{http_code}' -X DELETE \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                -H "Content-Type: application/json" \
+                "${API}/zones/${ZONE_ID}/dns_records/${RECORD_ID}")"
+              DELETE_BODY="${DELETE_RESULT%$'\n'*}"
+              DELETE_CODE="${DELETE_RESULT##*$'\n'}"
 
-          STILL_CONFLICTING="$(jq -r '
-            .result[]
-            | select(.name == env.CUSTOM_DOMAIN and (.type == "A" or .type == "AAAA" or .type == "CNAME") and .content != "100::" and .content != "192.0.2.0")
-            | [.id, .type, .content]
-            | @tsv
-          ' <<< "${REMAINING}")"
+              if [ "${DELETE_CODE}" != "200" ]; then
+                echo "Warning: delete returned HTTP ${DELETE_CODE} for ${RECORD_TYPE} ${CUSTOM_HOSTNAME}."
+                jq '{ errors, messages }' <<< "${DELETE_BODY}" || true
+              fi
+            done <<< "${CONFLICTS}"
 
-          if [ -n "${STILL_CONFLICTING}" ]; then
-            echo "Residual conflicting DNS records remain for ${CUSTOM_DOMAIN}:"
-            printf '%s\n' "${STILL_CONFLICTING}"
-            exit 1
-          fi
+            REMAINING="$(curl -fsS \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              "${API}/zones/${ZONE_ID}/dns_records?name=${CUSTOM_HOSTNAME}&per_page=100")"
+
+            STILL_CONFLICTING="$(CUSTOM_HOSTNAME="${CUSTOM_HOSTNAME}" jq -r '
+              .result[]
+              | select(.name == env.CUSTOM_HOSTNAME and (.type == "A" or .type == "AAAA" or .type == "CNAME") and .content != "100::" and (.content | startswith("192.0.2.") | not))
+              | [.id, .type, .content]
+              | @tsv
+            ' <<< "${REMAINING}")"
+
+            if [ -n "${STILL_CONFLICTING}" ]; then
+              echo "Residual conflicting DNS records remain for ${CUSTOM_HOSTNAME}:"
+              printf '%s\n' "${STILL_CONFLICTING}"
+              exit 1
+            fi
+          done <<< "${CUSTOM_DOMAIN_LIST}"
 
       - name: ⚙ 设置 pnpm / Set up pnpm
         uses: pnpm/action-setup@v4.1.0
@@ -169,8 +237,8 @@ jobs:
             exit 1
           fi
           
-          if [ -z "$CUSTOM_DOMAIN" ]; then
-            echo "::warning:: CUSTOM_DOMAIN variable is not set."
+          if [ -z "${CUSTOM_DOMAIN_LIST}" ]; then
+            echo "::warning:: CUSTOM_DOMAINS variable is not set."
           fi
           
           CONFIG_FILE="wrangler-action.toml"
@@ -187,9 +255,15 @@ jobs:
             sed -i '/^linuxdo_client_id = /,/^linuxdo_switch = /d' "$CONFIG_FILE"
           fi
           
-          if [ -z "$CUSTOM_DOMAIN" ]; then
-            sed -i '/\[\[routes\]\]/,/^$/d' "$CONFIG_FILE"
-          fi
+          ROUTE_BLOCKS=""
+          while IFS= read -r CUSTOM_HOSTNAME; do
+            [ -n "${CUSTOM_HOSTNAME}" ] || continue
+            ROUTE_BLOCKS="${ROUTE_BLOCKS}[[routes]]
+          pattern = \"${CUSTOM_HOSTNAME}\"
+          custom_domain = true
+
+          "
+          done <<< "${CUSTOM_DOMAIN_LIST}"
           
           if [ "$(printf '%s' "$CLOUDFLARE_EMAIL" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
             cat >> "$CONFIG_FILE" <<'EOF'
@@ -200,7 +274,7 @@ jobs:
           fi
 
           sed -i "s|\${NAME}|${NAME}|g" "$CONFIG_FILE"
-          sed -i "s|\${CUSTOM_DOMAIN}|${CUSTOM_DOMAIN}|g" "$CONFIG_FILE"
+          CUSTOM_DOMAIN_ROUTES="${ROUTE_BLOCKS}" perl -0pi -e 's/\$\{CUSTOM_DOMAIN_ROUTES\}/$ENV{CUSTOM_DOMAIN_ROUTES}/g' "$CONFIG_FILE"
           sed -i "s|\"\${DOMAIN}\"|${DOMAIN}|g" "$CONFIG_FILE"
           sed -i "s|\${ADMIN}|${ADMIN}|g" "$CONFIG_FILE"
           sed -i "s|\${JWT_SECRET}|${JWT_SECRET}|g" "$CONFIG_FILE"
@@ -318,7 +392,7 @@ jobs:
 
       - name: 📬 邮箱路由已手动配置 / Email Routing already configured
         run: |
-          echo "Cloudflare Email Routing is already configured in the dashboard for ${CUSTOM_DOMAIN:-this domain}."
+          echo "Cloudflare Email Routing is already configured in the dashboard for ${CUSTOM_DOMAINS:-${CUSTOM_DOMAIN:-this domain}}."
           echo "Skipping API setup to avoid requiring extra routing permissions on the deploy token."
 
       - name: 📬 配置邮箱路由 / Configure Email Routing
@@ -408,11 +482,11 @@ jobs:
           echo "🛠️ Starting database initialization..."
           sleep 15
           
-          WORKER_URL="${CUSTOM_DOMAIN:+https://$CUSTOM_DOMAIN}"
+          WORKER_URL="${FIRST_CUSTOM_DOMAIN:+https://$FIRST_CUSTOM_DOMAIN}"
           WORKER_URL="${WORKER_URL:-${{ steps.deploy.outputs.worker_url }}}"
           
           if [ -z "$WORKER_URL" ]; then
-            echo "❌ Preview URL not available. Please set CUSTOM_DOMAIN."
+            echo "❌ Preview URL not available. Please set CUSTOM_DOMAINS."
             exit 1
           fi
           
