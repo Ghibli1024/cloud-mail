@@ -1,0 +1,96 @@
+name: Bootstrap Cloudflare zone
+
+on:
+  workflow_dispatch:
+    inputs:
+      root_domain:
+        description: Root domain to add or inspect in Cloudflare
+        required: true
+        default: totoro0x400.bond
+
+jobs:
+  bootstrap-zone:
+    name: Bootstrap Cloudflare zone
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      ROOT_DOMAIN: ${{ inputs.root_domain }}
+
+    steps:
+      - name: Create or inspect zone
+        run: |
+          set -euo pipefail
+
+          for key in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID ROOT_DOMAIN; do
+            if [ -z "${!key:-}" ]; then
+              echo "::error::${key} is required."
+              exit 1
+            fi
+          done
+
+          API="https://api.cloudflare.com/client/v4"
+
+          cf_request() {
+            local method="$1"
+            local path="$2"
+            local data="${3:-}"
+
+            if [ -n "${data}" ]; then
+              curl -sS -w $'\n%{http_code}' -X "${method}" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                -H "Content-Type: application/json" \
+                --data "${data}" \
+                "${API}${path}"
+            else
+              curl -sS -w $'\n%{http_code}' -X "${method}" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                -H "Content-Type: application/json" \
+                "${API}${path}"
+            fi
+          }
+
+          lookup_response="$(cf_request GET "/zones?name=${ROOT_DOMAIN}&per_page=1")"
+          lookup_body="${lookup_response%$'\n'*}"
+          lookup_code="${lookup_response##*$'\n'}"
+
+          if [ "${lookup_code}" != "200" ]; then
+            echo "::error::Cannot list Cloudflare zones. HTTP ${lookup_code}."
+            jq '{success, errors, messages}' <<< "${lookup_body}" || true
+            exit 1
+          fi
+
+          zone_id="$(jq -r '.result[0].id // empty' <<< "${lookup_body}")"
+
+          if [ -z "${zone_id}" ]; then
+            echo "Cloudflare zone does not exist yet: ${ROOT_DOMAIN}"
+            create_body="$(jq -n \
+              --arg name "${ROOT_DOMAIN}" \
+              --arg account_id "${CLOUDFLARE_ACCOUNT_ID}" \
+              '{name: $name, account: {id: $account_id}, type: "full"}')"
+            create_response="$(cf_request POST "/zones" "${create_body}")"
+            create_result="${create_response%$'\n'*}"
+            create_code="${create_response##*$'\n'}"
+
+            echo "Create zone status: ${create_code}"
+            jq '{success, errors, messages, result: {id: .result.id, name: .result.name, status: .result.status, name_servers: .result.name_servers}}' <<< "${create_result}" || true
+
+            if [ "${create_code}" != "200" ] && [ "${create_code}" != "201" ]; then
+              echo "::error::Cloudflare zone creation failed."
+              exit 1
+            fi
+
+            zone_response="${create_result}"
+          else
+            echo "Cloudflare zone already exists: ${ROOT_DOMAIN}"
+            zone_response="${lookup_body}"
+          fi
+
+          echo "Zone summary:"
+          jq -r '
+            .result[0] // .result
+            | "name=\(.name)\nstatus=\(.status)\nname_servers=\((.name_servers // []) | join(","))"
+          ' <<< "${zone_response}"
+
+          echo "Public NS via 1.1.1.1:"
+          dig +short NS "${ROOT_DOMAIN}" @1.1.1.1 || true
