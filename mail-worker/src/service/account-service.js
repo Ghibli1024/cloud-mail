@@ -103,6 +103,31 @@ const accountService = {
 		return orm(c).select().from(account).where(sql`${account.email} COLLATE NOCASE = ${email}`).get();
 	},
 
+	async autoCreateForAdminDomain(c, email) {
+		email = normalizeEmail(email);
+
+		if (!verifyUtils.isEmail(email) || !hasEnvDomain(c, email)) {
+			return null;
+		}
+
+		const accountRow = await this.selectByEmailIncludeDel(c, email);
+		if (accountRow) {
+			return accountRow;
+		}
+
+		const adminUser = await userService.selectByEmail(c, c.env.admin);
+		if (!adminUser) {
+			return null;
+		}
+
+		await c.env.db.prepare(`
+			INSERT OR IGNORE INTO account (email, name, user_id)
+			VALUES (?, ?, ?)
+		`).bind(email, emailUtils.getName(email), adminUser.userId).run();
+
+		return this.selectByEmailIncludeDel(c, email);
+	},
+
 	list(c, params, userId) {
 
 		let { accountId, size, lastSort } = params;
@@ -266,5 +291,27 @@ const accountService = {
 		await orm(c).update(account).set({ sort: mainSort - 1 }).where(and(eq(account.accountId, accountId),eq(account.userId,userId))).run();
 	}
 };
+
+function normalizeEmail(email) {
+	return typeof email === 'string' ? email.trim().toLowerCase() : '';
+}
+
+function hasEnvDomain(c, email) {
+	let domains = c.env.domain;
+
+	if (typeof domains === 'string') {
+		try {
+			domains = JSON.parse(domains);
+		} catch (error) {
+			return false;
+		}
+	}
+
+	if (!Array.isArray(domains)) {
+		return false;
+	}
+
+	return domains.includes(emailUtils.getDomain(email));
+}
 
 export default accountService;
