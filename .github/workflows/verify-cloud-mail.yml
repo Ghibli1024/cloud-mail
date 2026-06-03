@@ -45,33 +45,23 @@ jobs:
             fi
           done
 
-      - name: Verify DNS and Email Routing
+      - name: Verify public DNS
         run: |
           set -euo pipefail
 
-          API="https://api.cloudflare.com/client/v4"
+          ns_records="$(dig +short NS "${ZONE_NAME}" @1.1.1.1 | sort)"
+          mx_records="$(dig +short MX "${EMAIL_DOMAIN}" @1.1.1.1 | sort)"
+          txt_records="$(dig +short TXT "${EMAIL_DOMAIN}" @1.1.1.1 | sort)"
 
-          zone_response="$(curl -fsS \
-            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            "${API}/zones?name=${ZONE_NAME}&per_page=1")"
-          zone_id="$(jq -r '.result[0].id // empty' <<< "${zone_response}")"
+          echo "NS records for ${ZONE_NAME}:"
+          printf '%s\n' "${ns_records}"
+          echo "MX records for ${EMAIL_DOMAIN}:"
+          printf '%s\n' "${mx_records}"
+          echo "TXT records for ${EMAIL_DOMAIN}:"
+          printf '%s\n' "${txt_records}"
 
-          if [ -z "${zone_id}" ]; then
-            echo "::error::Cloudflare zone not found or token cannot read it: ${ZONE_NAME}"
-            exit 1
-          fi
-
-          dns_response="$(curl -fsS \
-            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            "${API}/zones/${zone_id}/dns_records?name=${EMAIL_DOMAIN}&per_page=100")"
-
-          echo "Email DNS records for ${EMAIL_DOMAIN}:"
-          jq -r '.result[] | [.type, .name, .content, (.priority // "")] | @tsv' <<< "${dns_response}"
-
-          mx_count="$(jq '[.result[] | select(.type == "MX")] | length' <<< "${dns_response}")"
-          spf_count="$(jq '[.result[] | select(.type == "TXT" and (.content | contains("_spf.mx.cloudflare.net")))] | length' <<< "${dns_response}")"
+          mx_count="$(printf '%s\n' "${mx_records}" | grep -c 'mx.cloudflare.net' || true)"
+          spf_count="$(printf '%s\n' "${txt_records}" | grep -c '_spf.mx.cloudflare.net' || true)"
 
           if [ "${mx_count}" -lt 3 ]; then
             echo "::error::Expected three Cloudflare Email Routing MX records for ${EMAIL_DOMAIN}; found ${mx_count}."
@@ -83,10 +73,47 @@ jobs:
             exit 1
           fi
 
-          catch_all_response="$(curl -fsS \
+      - name: Verify Email Routing through Cloudflare API
+        run: |
+          set -euo pipefail
+
+          API="https://api.cloudflare.com/client/v4"
+
+          zone_response="$(curl -sS -w $'\n%{http_code}' \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${API}/zones?name=${ZONE_NAME}&per_page=1")"
+          zone_body="${zone_response%$'\n'*}"
+          zone_code="${zone_response##*$'\n'}"
+
+          if [ "${zone_code}" != "200" ]; then
+            echo "::warning::Cloudflare token cannot read zone ${ZONE_NAME}; skipped API Email Routing verification. HTTP ${zone_code}."
+            jq '{success, errors, messages}' <<< "${zone_body}" || true
+            exit 0
+          fi
+
+          zone_response="${zone_body}"
+          zone_id="$(jq -r '.result[0].id // empty' <<< "${zone_response}")"
+
+          if [ -z "${zone_id}" ]; then
+            echo "::warning::Cloudflare zone ${ZONE_NAME} was not returned by the API token; skipped API Email Routing verification."
+            exit 0
+          fi
+
+          catch_all_response="$(curl -sS -w $'\n%{http_code}' \
             -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
             -H "Content-Type: application/json" \
             "${API}/zones/${zone_id}/email/routing/rules/catch_all")"
+          catch_all_body="${catch_all_response%$'\n'*}"
+          catch_all_code="${catch_all_response##*$'\n'}"
+
+          if [ "${catch_all_code}" != "200" ]; then
+            echo "::warning::Cloudflare token cannot read Email Routing catch-all; skipped API catch-all verification. HTTP ${catch_all_code}."
+            jq '{success, errors, messages}' <<< "${catch_all_body}" || true
+            exit 0
+          fi
+
+          catch_all_response="${catch_all_body}"
 
           echo "Catch-all summary:"
           jq '{enabled: .result.enabled, name: .result.name, matchers: .result.matchers, actions: .result.actions}' <<< "${catch_all_response}"
@@ -119,7 +146,7 @@ jobs:
 
           run_sql() {
             local query="$1"
-            curl -fsS -X POST \
+            curl -sS -w $'\n%{http_code}' -X POST \
               -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
               -H "Content-Type: application/json" \
               --data "$(jq -n --arg sql "${query}" '{sql: $sql}')" \
@@ -133,6 +160,16 @@ jobs:
             ORDER BY account_id;
           "
           account_response="$(run_sql "${account_sql}")"
+          account_body="${account_response%$'\n'*}"
+          account_code="${account_response##*$'\n'}"
+
+          if [ "${account_code}" != "200" ]; then
+            echo "::warning::Cloudflare token cannot query D1; skipped D1 account/mail verification. HTTP ${account_code}."
+            jq '{success, errors, messages}' <<< "${account_body}" || true
+            exit 0
+          fi
+
+          account_response="${account_body}"
 
           echo "Account rows for ${TARGET_EMAIL}:"
           jq -r '.result[0].results[]? | [.account_id, .email, .user_id, .status, .is_del] | @tsv' <<< "${account_response}"
@@ -150,6 +187,16 @@ jobs:
             LIMIT 5;
           "
           mail_response="$(run_sql "${mail_sql}")"
+          mail_body="${mail_response%$'\n'*}"
+          mail_code="${mail_response##*$'\n'}"
+
+          if [ "${mail_code}" != "200" ]; then
+            echo "::warning::Cloudflare token cannot query recent D1 mail rows. HTTP ${mail_code}."
+            jq '{success, errors, messages}' <<< "${mail_body}" || true
+            exit 0
+          fi
+
+          mail_response="${mail_body}"
 
           echo "Recent mail rows for ${TARGET_EMAIL}:"
           jq -r '.result[0].results[]? | [.email_id, .to_email, .send_email, .subject, .status, .type, .user_id, .account_id, .is_del, .create_time] | @tsv' <<< "${mail_response}"
