@@ -100,6 +100,45 @@ jobs:
             exit 0
           fi
 
+          rules_response="$(curl -sS -w $'\n%{http_code}' \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${API}/zones/${zone_id}/email/routing/rules?per_page=100")"
+          rules_body="${rules_response%$'\n'*}"
+          rules_code="${rules_response##*$'\n'}"
+
+          if [ "${rules_code}" != "200" ]; then
+            echo "::warning::Cloudflare token cannot read Email Routing rules; skipped API routing-rule verification. HTTP ${rules_code}."
+            jq '{success, errors, messages}' <<< "${rules_body}" || true
+            exit 0
+          fi
+
+          echo "Routing rules for ${ZONE_NAME}:"
+          jq -r '
+            .result[]?
+            | [
+                .name,
+                (.matchers // [] | map("\(.type):\(.value)") | join(",")),
+                (.actions // [] | map("\(.type):\(.value | join(","))") | join(",")),
+                .enabled
+              ]
+            | @tsv
+          ' <<< "${rules_body}"
+
+          exact_worker_rule_count="$(jq --arg target "${TARGET_EMAIL}" --arg worker "${WORKER_NAME}" '
+            [
+              .result[]?
+              | select(.enabled == true)
+              | select([.matchers[]? | select(.type == "literal" and (.value | ascii_downcase) == ($target | ascii_downcase))] | length > 0)
+              | select([.actions[]? | select(.type == "worker") | .value[]? | select(. == $worker)] | length > 0)
+            ] | length
+          ' <<< "${rules_body}")"
+
+          if [ "${exact_worker_rule_count}" -ge 1 ]; then
+            echo "✅ Exact routing rule sends ${TARGET_EMAIL} to Worker ${WORKER_NAME}."
+            exit 0
+          fi
+
           catch_all_response="$(curl -sS -w $'\n%{http_code}' \
             -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
             -H "Content-Type: application/json" \
@@ -128,14 +167,16 @@ jobs:
           ' <<< "${catch_all_response}")"
 
           if [ "$(jq -r '.result.enabled' <<< "${catch_all_response}")" != "true" ]; then
-            echo "::error::Catch-all rule is not enabled."
+            echo "::error::No enabled exact route for ${TARGET_EMAIL}, and catch-all rule is not enabled."
             exit 1
           fi
 
           if [ "${worker_target_count}" -lt 1 ]; then
-            echo "::error::Catch-all rule does not target Worker ${WORKER_NAME}."
+            echo "::error::No enabled exact route for ${TARGET_EMAIL}, and catch-all rule does not target Worker ${WORKER_NAME}."
             exit 1
           fi
+
+          echo "✅ Catch-all sends unmatched mail to Worker ${WORKER_NAME}."
 
       - name: Verify D1 account and recent mail
         if: ${{ env.D1_DATABASE_ID != '' }}
